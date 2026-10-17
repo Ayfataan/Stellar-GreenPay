@@ -5,8 +5,10 @@
 // This test deploys both compiled contracts in one "Env", links them, and
 // verifies that pausing GreenPay blocks "create_job" and "release_milestone",
 // while unpausing restores normal operations.
-
-#![cfg(feature = "testutils")]
+//
+// Runs under plain `cargo test --workspace` (contracts CI): the testutils
+// capability comes from the dev-dependency on `soroban-sdk`, so no feature
+// flag is required to compile or execute this suite.
 
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
@@ -14,12 +16,8 @@ use soroban_sdk::{
     Address, BytesN, Env, String as SorobanString, Vec,
 };
 
-use escrow_contract::{
-    EscrowContract, EscrowContractClient, JobStatus, Milestone,
-};
-use greenpay_contract::{
-    GreenPayContract, GreenPayContractClient,
-};
+use escrow_contract::{EscrowContract, EscrowContractClient, JobStatus, Milestone};
+use greenpay_contract::{GreenPayContract, GreenPayContractClient};
 
 #[test]
 fn test_cross_contract_pause_blocks_escrow_operations() {
@@ -45,7 +43,9 @@ fn test_cross_contract_pause_blocks_escrow_operations() {
     let client_addr = Address::generate(&env);
     let freelancer_addr = Address::generate(&env);
     let token_admin = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
     StellarAssetClient::new(&env, &token).mint(&client_addr, &2000i128);
 
     let job_id = SorobanString::from_str(&env, "job-1");
@@ -58,7 +58,14 @@ fn test_cross_contract_pause_blocks_escrow_operations() {
     });
 
     // Create job should work when not paused
-    escrow_client.create_job(&client_addr, &freelancer_addr, &job_id, &token, &1000i128, &milestones);
+    escrow_client.create_job(
+        &client_addr,
+        &freelancer_addr,
+        &job_id,
+        &token,
+        &1000i128,
+        &milestones,
+    );
     let job = escrow_client.get_job(&job_id).expect("Job should exist");
     assert_eq!(job.status, JobStatus::Escrowed);
 
@@ -67,12 +74,25 @@ fn test_cross_contract_pause_blocks_escrow_operations() {
 
     // Create new job should fail when GreenPay is paused
     let job_id2 = SorobanString::from_str(&env, "job-2");
-    let result = escrow_client.try_create_job(&client_addr, &freelancer_addr, &job_id2, &token, &500i128, &milestones);
-    assert!(result.is_err(), "create_job should fail when GreenPay is paused");
+    let result = escrow_client.try_create_job(
+        &client_addr,
+        &freelancer_addr,
+        &job_id2,
+        &token,
+        &500i128,
+        &milestones,
+    );
+    assert!(
+        result.is_err(),
+        "create_job should fail when GreenPay is paused"
+    );
 
     // release_milestone should fail when GreenPay is paused
     let result = escrow_client.try_release_milestone(&client_addr, &job_id, &0u32);
-    assert!(result.is_err(), "release_milestone should fail when GreenPay is paused");
+    assert!(
+        result.is_err(),
+        "release_milestone should fail when GreenPay is paused"
+    );
 
     // Unpause GreenPay contract
     greenpay_client.unpause(&greenpay_admin);
@@ -107,7 +127,9 @@ fn test_cross_contract_pause_blocks_release_funds() {
     let client_addr = Address::generate(&env);
     let freelancer_addr = Address::generate(&env);
     let token_admin = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
     StellarAssetClient::new(&env, &token).mint(&client_addr, &1000i128);
 
     let job_id = SorobanString::from_str(&env, "job-release");
@@ -119,13 +141,23 @@ fn test_cross_contract_pause_blocks_release_funds() {
     });
 
     // Create job
-    escrow_client.create_job(&client_addr, &freelancer_addr, &job_id, &token, &1000i128, &milestones);
+    escrow_client.create_job(
+        &client_addr,
+        &freelancer_addr,
+        &job_id,
+        &token,
+        &1000i128,
+        &milestones,
+    );
 
     // Pause and verify release_funds is blocked
     greenpay_client.pause(&greenpay_admin);
     let report_hash = BytesN::from_array(&env, &[0xab; 32]);
     let result = escrow_client.try_release_funds(&escrow_admin, &job_id, &report_hash);
-    assert!(result.is_err(), "release_funds should fail when GreenPay is paused");
+    assert!(
+        result.is_err(),
+        "release_funds should fail when GreenPay is paused"
+    );
 
     // Unpause and verify it works
     greenpay_client.unpause(&greenpay_admin);

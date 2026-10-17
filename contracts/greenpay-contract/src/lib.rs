@@ -48,6 +48,8 @@ pub enum ContractError {
     InvalidUrl = 5,
     /// Reentrant call detected.
     Reentrant = 6,
+    /// A pending admin transfer is already in progress.
+    PendingAdminExists = 7,
 }
 
 
@@ -317,13 +319,8 @@ pub enum DataKey {
     MaxPriceAgeSecs,
     // Reentrancy guard
     IsProcessing,
-}
-
-#[contracterror]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum ContractError {
-    PendingAdminExists = 1,
+    // Donation matching pledge
+    MatchPledge(String),
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -2511,18 +2508,33 @@ impl GreenPayContract {
 
     /// Admin-only: Upgrade the contract to a new WASM code.
     /// Preserves all on-chain state while replacing the contract implementation.
-    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
-        let admin: Address = env
-            .storage()
-              pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
-        let admin: Address = env
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+        admin.require_auth();
+        let stored_admin: Address = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
             .expect("Not initialized");
-        admin.require_auth();
+        if stored_admin != admin {
+            panic!("Only admin can upgrade");
+        }
 
+        // Store the new WASM hash for upgrade verification
+        env.storage().instance().set(&DataKey::ContractWasmHash, &new_wasm_hash);
+
+        // Execute the actual upgrade
         env.deployer().update_current_contract_wasm(new_wasm_hash);
+
+        env.events().publish((symbol_short!("upgrade"),), admin);
+    }
+
+    /// Get the WASM hash most recently recorded by an authorized upgrade.
+    ///
+    /// Returns `None` until the first successful call to `upgrade`. This value
+    /// is retained in instance storage so clients can inspect which code hash
+    /// the administrator requested for the current contract.
+    pub fn get_contract_wasm_hash(env: Env) -> Option<BytesN<32>> {
+        env.storage().instance().get(&DataKey::ContractWasmHash)
     }
 
     // ─── Donation matching program (2x match pledges) ─────────────────────────
@@ -2707,6 +2719,7 @@ impl OracleInterface for MockOracle {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
     use soroban_sdk::token::StellarAssetClient;
     use super::*;
@@ -2843,7 +2856,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #1)")]
+    #[should_panic(expected = "Error(Contract, #7)")]
     fn test_second_admin_proposal_fails_when_one_is_pending() {
         let env = Env::default();
         env.mock_all_auths();
@@ -2970,7 +2983,7 @@ mod tests {
         let donor = Address::generate(&env);
         let usdc_amount = 4_000_000i128;
         StellarAssetClient::new(&env, &token).mint(&donor, &usdc_amount);
-        client.donate_usdc(&token, &donor, &pid, &usdc_amount, &0u32);
+        client.donate_usdc(&token, &donor, &pid, &usdc_amount, &8i128, &0u32);
 
         // 4 USDC at 2.5 XLM per USDC = 10 XLM, represented in stroops.
         assert_eq!(client.get_global_total(), 10 * STROOP);
@@ -2996,7 +3009,7 @@ mod tests {
         // (3600s) and the resolution-derived window alike.
         env.ledger().set_timestamp(1_000 + 7_200);
 
-        client.donate_usdc(&token, &donor, &pid, &usdc_amount, &0u32);
+        client.donate_usdc(&token, &donor, &pid, &usdc_amount, &8i128, &0u32);
     }
 
     #[test]
@@ -3015,7 +3028,7 @@ mod tests {
         // well within both the default and resolution-derived windows.
         env.ledger().set_timestamp(1_000 + 60);
 
-        client.donate_usdc(&token, &donor, &pid, &usdc_amount, &0u32);
+        client.donate_usdc(&token, &donor, &pid, &usdc_amount, &8i128, &0u32);
 
         assert_eq!(client.get_donation_count(), 1);
     }
@@ -3928,19 +3941,26 @@ mod tests {
         let token = env.register_stellar_asset_contract_v2(token_admin).address();
         let token_client = StellarAssetClient::new(&env, &token);
 
-        let donor      = Address::generate(&env);
-        let usdc_amt   = 1_000_000i128; // 0.1 USDC (7 decimal places)
-        // Simulate a DEX mid-price of 9 XLM per USDC (in stroops ratio: 9)
-        let rate       = 9i128;
-        let expected_xlm = usdc_amt.checked_mul(rate).unwrap();
+        let amount = 100 * STROOP;
+        token_client.mint(&donor, &amount);
+        client.donate(&token, &donor, &pid, &amount, &0u32);
 
-        usdc_client.mint(&donor, &usdc_amt);
-        client.donate_usdc(&usdc_token, &donor, &pid, &usdc_amt, &rate, &0u32);
+        let wallet = client.get_project(&pid).wallet;
+        let project_before = client.get_project(&pid);
+        let donor_stats_before = client.get_donor_stats(&donor);
+        assert_eq!(project_before.total_raised, amount);
+        assert_eq!(donor_stats_before.total_donated, amount);
 
-        let project = client.get_project(&pid);
-        assert_eq!(project.total_raised, expected_xlm);
-        let global = client.get_global_total();
-        assert_eq!(global, expected_xlm);
+        client.refund_donation(&admin, &pid, &donor, &amount, &token);
+
+        let project_after = client.get_project(&pid);
+        let donor_stats_after = client.get_donor_stats(&donor);
+        assert_eq!(project_after.total_raised, 0);
+        assert_eq!(donor_stats_after.total_donated, 0);
+
+        let native_client = soroban_sdk::token::Client::new(&env, &token);
+        assert_eq!(native_client.balance(&donor), amount);
+        assert_eq!(native_client.balance(&wallet), 0);
     }
 
     #[test]
@@ -3952,10 +3972,7 @@ mod tests {
         let token_admin = Address::generate(&env);
         let token = env.register_stellar_asset_contract_v2(token_admin).address();
 
-        let donor = Address::generate(&env);
-        usdc_client.mint(&donor, &1_000_000i128);
-        // Rate of 0 must be rejected
-        client.donate_usdc(&usdc_token, &donor, &pid, &1_000_000i128, &0i128, &0u32);
+        client.refund_donation(&not_admin, &pid, &donor, &(10 * STROOP), &token);
     }
 
     // ─── Minimum donation enforcement (#1043) ─────────────────────────────────
@@ -4149,7 +4166,7 @@ mod tests {
     fn test_donate_usdc_zero_amount_is_rejected() {
         let (_env, client, token, pid, donor, _wallet) = setup_min_donation();
 
-        client.donate_usdc(&token, &donor, &pid, &0i128, &0u32);
+        client.donate_usdc(&token, &donor, &pid, &0i128, &8i128, &0u32);
     }
 
     /// Negative USDC amounts are rejected the same way.
@@ -4158,7 +4175,7 @@ mod tests {
     fn test_donate_usdc_negative_amount_is_rejected() {
         let (_env, client, token, pid, donor, _wallet) = setup_min_donation();
 
-        client.donate_usdc(&token, &donor, &pid, &-1i128, &0u32);
+        client.donate_usdc(&token, &donor, &pid, &-1i128, &8i128, &0u32);
     }
     #[test]
     fn test_global_stats_cached_single_entry() {
