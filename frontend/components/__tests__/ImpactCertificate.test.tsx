@@ -66,3 +66,4 @@ describe("ImpactCertificate", () => {
     expect(screen.getByText(label)).toBeInTheDocument();
   });
 });
+
