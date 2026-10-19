@@ -17,11 +17,11 @@ mod fuzz_tests;
  *   6. Community governance: badge holders vote to verify new projects
  *
  * Build:
- *   cargo build --target wasm32-unknown-unknown --release
+ *   cargo build --target wasm32v1-none --release
  *
  * Deploy:
  *   stellar contract deploy \
- *     --wasm target/wasm32-unknown-unknown/release/greenpay_contract.wasm \
+ *     --wasm target/wasm32v1-none/release/greenpay_contract.wasm \
  *     --source alice --network testnet
  */
 use soroban_sdk::{
@@ -48,8 +48,8 @@ pub enum ContractError {
     InvalidUrl = 5,
     /// Reentrant call detected.
     Reentrant = 6,
-    /// A pending admin transfer is already in progress.
     PendingAdminExists = 7,
+    ProposalExpired = 8,
 }
 
 
@@ -265,6 +265,13 @@ pub struct MatchPledge {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingAdmin {
+    pub address: Address,
+    pub proposal_expires_at: u64,
+}
+
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct ActiveMatchStatus {
     pub has_active_match: bool,
@@ -315,6 +322,7 @@ pub enum DataKey {
     // Contract-wide emergency pause status
     Paused,
     PendingAdmin,
+    AdminProposalTTL,
     // Configurable staleness bound for oracle price quotes (issue #1146)
     MaxPriceAgeSecs,
     // Reentrancy guard
@@ -335,6 +343,9 @@ const ORACLE_MAX_AGE_MULTIPLIER: u64 = 3;
 /// (older than this, or than `ORACLE_MAX_AGE_MULTIPLIER` update intervals,
 /// whichever is stricter) is rejected in `donate_usdc`.
 const DEFAULT_MAX_PRICE_AGE_SECS: u64 = 3600;
+
+/// Default TTL for admin proposals: 7 days in seconds (604,800s).
+const DEFAULT_ADMIN_PROPOSAL_TTL: u64 = 7 * 24 * 60 * 60;
 
 // 7 days × 24 h × 3600 s ÷ 5 s per ledger ≈ 120_960 ledgers — used as the
 // default when `create_proposal` is called without an explicit duration.
@@ -1679,6 +1690,31 @@ impl GreenPayContract {
             .expect("Not initialized")
     }
 
+    pub fn set_admin_proposal_ttl(env: Env, admin: Address, ttl_seconds: u64) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if stored_admin != admin {
+            panic!("Only admin can set admin proposal TTL");
+        }
+        if ttl_seconds == 0 {
+            panic!("TTL must be greater than zero");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminProposalTTL, &ttl_seconds);
+    }
+
+    pub fn get_admin_proposal_ttl(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::AdminProposalTTL)
+            .unwrap_or(DEFAULT_ADMIN_PROPOSAL_TTL)
+    }
+
     /// Propose a new admin. The current admin keeps control until the
     /// proposed address explicitly accepts the role.
     pub fn propose_new_admin(
@@ -1702,7 +1738,19 @@ impl GreenPayContract {
             return Err(ContractError::PendingAdminExists);
         }
 
-        env.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
+        let ttl = Self::get_admin_proposal_ttl(env.clone());
+        let proposal_expires_at = env
+            .ledger()
+            .timestamp()
+            .checked_add(ttl)
+            .expect("Timestamp overflow");
+
+        let pending = PendingAdmin {
+            address: new_admin.clone(),
+            proposal_expires_at,
+        };
+
+        env.storage().instance().set(&DataKey::PendingAdmin, &pending);
         env.events()
             .publish((symbol_short!("adm_prop"), admin), new_admin);
         Ok(())
@@ -1727,13 +1775,16 @@ impl GreenPayContract {
     /// Accept a pending admin proposal and finalize the admin rotation.
     pub fn accept_admin(env: Env, new_admin: Address) {
         new_admin.require_auth();
-        let pending_admin: Address = env
+        let pending: PendingAdmin = env
             .storage()
             .instance()
             .get(&DataKey::PendingAdmin)
             .expect("No pending admin proposal");
-        if pending_admin != new_admin {
+        if pending.address != new_admin {
             panic!("Only pending admin can accept admin role");
+        }
+        if env.ledger().timestamp() > pending.proposal_expires_at {
+            soroban_sdk::panic_with_error!(&env, ContractError::ProposalExpired);
         }
 
         let previous_admin: Address = env
@@ -1749,6 +1800,14 @@ impl GreenPayContract {
 
     /// Read the current pending admin proposal, if any.
     pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get::<_, PendingAdmin>(&DataKey::PendingAdmin)
+            .map(|p| p.address)
+    }
+
+    /// Read full pending admin proposal details (address & expiration timestamp), if any.
+    pub fn get_pending_admin_details(env: Env) -> Option<PendingAdmin> {
         env.storage().instance().get(&DataKey::PendingAdmin)
     }
 
@@ -2949,6 +3008,102 @@ mod tests {
         client.propose_new_admin(&attacker, &new_admin);
     }
 
+    #[test]
+    fn test_proposal_accepted_within_7_days_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, GreenPayContract);
+        let client = GreenPayContractClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+
+        client.initialize(&admin);
+        client.propose_new_admin(&admin, &new_admin);
+
+        // Advance ledger timestamp by 3 days (259,200 seconds)
+        env.ledger().set_timestamp(env.ledger().timestamp() + 259_200);
+
+        client.accept_admin(&new_admin);
+        assert_eq!(client.get_admin(), new_admin);
+        assert_eq!(client.get_pending_admin(), None);
+    }
+
+    #[test]
+    fn test_proposal_accepted_after_expiry_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, GreenPayContract);
+        let client = GreenPayContractClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+
+        client.initialize(&admin);
+        client.propose_new_admin(&admin, &new_admin);
+
+        // Advance ledger timestamp past 7 days (604,801 seconds)
+        env.ledger().set_timestamp(env.ledger().timestamp() + 604_801);
+
+        let res = client.try_accept_admin(&new_admin);
+        assert_eq!(
+            res,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::ProposalExpired as u32
+            )))
+        );
+    }
+
+    #[test]
+    fn test_admin_configures_custom_ttl_and_respected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, GreenPayContract);
+        let client = GreenPayContractClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+
+        client.initialize(&admin);
+        // Admin configures custom TTL to 3600 seconds (1 hour)
+        client.set_admin_proposal_ttl(&admin, &3600);
+        assert_eq!(client.get_admin_proposal_ttl(), 3600);
+
+        client.propose_new_admin(&admin, &new_admin);
+
+        // Advance by 1800 seconds (30 mins) -> still valid
+        env.ledger().set_timestamp(env.ledger().timestamp() + 1800);
+        assert_eq!(client.get_pending_admin(), Some(new_admin.clone()));
+
+        // Advance past 3600 seconds
+        env.ledger().set_timestamp(env.ledger().timestamp() + 1801);
+
+        let res = client.try_accept_admin(&new_admin);
+        assert_eq!(
+            res,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::ProposalExpired as u32
+            )))
+        );
+    }
+
+    #[test]
+    fn test_proposal_accepted_at_expiry_boundary() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, GreenPayContract);
+        let client = GreenPayContractClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+
+        client.initialize(&admin);
+        let start_time = env.ledger().timestamp();
+        client.propose_new_admin(&admin, &new_admin);
+
+        // Advance to exact expiry boundary: start_time + 604,800
+        env.ledger().set_timestamp(start_time + 604_800);
+
+        client.accept_admin(&new_admin);
+        assert_eq!(client.get_admin(), new_admin);
+    }
+
         #[test]
     fn test_get_donation_record() {
         let (env, _cid, client, admin, pid) = crate::tests::setup();
@@ -3449,6 +3604,52 @@ mod tests {
             assert_eq!(global_total, amount);
             assert_eq!(global_co2, expected_co2);
         });
+    }
+
+    /// `upgrade()` is admin-gated by address comparison: passing anyone other
+    /// than the stored admin must panic, even when authorization itself is
+    /// satisfied (mock_all_auths). This exercises the stored-admin check
+    /// independently of the require_auth() layer (issue #1636).
+    #[test]
+    #[should_panic(expected = "Only admin can upgrade")]
+    fn test_upgrade_rejects_non_admin_caller() {
+        let (env, _cid, client, _admin, _pid) = crate::tests::setup();
+        let attacker = Address::generate(&env);
+        // The panic fires before env.deployer().update_current_contract_wasm(),
+        // so a placeholder hash is safe here.
+        let fake_hash = BytesN::from_array(&env, &[7u8; 32]);
+        client.upgrade(&attacker, &fake_hash);
+    }
+
+    /// `upgrade()` calls `admin.require_auth()` before anything else: with no
+    /// mocked authorizations, even the genuine stored admin address is
+    /// rejected at the auth layer, and no state may change as a result
+    /// (issue #1636). Mirrors the stored-admin test above so both guard
+    /// layers are covered.
+    #[test]
+    fn test_upgrade_requires_admin_authorization() {
+        // Deliberately no env.mock_all_auths(): require_auth() must reject.
+        let env = Env::default();
+        let cid = env.register_contract(None, GreenPayContract);
+        let client = GreenPayContractClient::new(&env, &cid);
+        let admin = Address::generate(&env);
+        // initialize() is permissionless, so no auth mocking is needed to
+        // bootstrap the contract.
+        client.initialize(&admin);
+
+        let fake_hash = BytesN::from_array(&env, &[7u8; 32]);
+        let result = client.try_upgrade(&admin, &fake_hash);
+        assert!(
+            result.is_err(),
+            "upgrade() must be rejected when the admin has not authorized the invocation"
+        );
+
+        // The rejected call must not have written the new WASM hash.
+        assert_eq!(
+            client.get_contract_wasm_hash(),
+            None,
+            "a rejected upgrade() must not persist a WASM hash"
+        );
     }
 
     // ─── Governance tests ─────────────────────────────────────────────────────
@@ -4251,5 +4452,358 @@ mod tests {
         assert_eq!(top_10.get(0).unwrap().total_donated, 200 * STROOP);
         assert_eq!(top_10.get(1).unwrap().total_donated, 190 * STROOP);
         assert_eq!(top_10.get(9).unwrap().total_donated, 110 * STROOP);
+    }
+
+    // ─── Tests for Donation Matching Program (Issue #1634) ──────────────────────
+
+    #[test]
+    fn test_create_match_pledge_success_and_events() {
+        let (env, _cid, client, _admin, pid) = setup();
+        let matcher = Address::generate(&env);
+        let cap = 100 * STROOP;
+        let deadline = env.ledger().sequence() + 500;
+
+        client.create_match_pledge(&matcher, &pid, &cap, &deadline);
+
+        // Check pledge_cr event emission immediately following the call
+        let all = env.events().all();
+        assert!(!all.events().is_empty());
+
+        let pledge = client.get_match_pledge(&pid).expect("pledge should exist");
+        assert_eq!(pledge.project_id, pid);
+        assert_eq!(pledge.matcher, matcher);
+        assert_eq!(pledge.cap_xlm, cap);
+        assert_eq!(pledge.matched_amount, 0);
+        assert_eq!(pledge.deadline_ledger, deadline);
+        assert!(pledge.active);
+
+        let status = client.get_active_match_status(&pid);
+        assert!(status.has_active_match);
+        assert_eq!(status.matcher, Some(matcher.clone()));
+        assert_eq!(status.cap_xlm, cap);
+        assert_eq!(status.matched_amount, 0);
+        assert_eq!(status.remaining_cap_xlm, cap);
+        assert_eq!(status.deadline_ledger, deadline);
+    }
+
+    #[test]
+    #[should_panic(expected = "Cap XLM must be positive")]
+    fn test_create_match_pledge_rejects_zero_cap() {
+        let (env, _cid, client, _admin, pid) = setup();
+        let matcher = Address::generate(&env);
+        let deadline = env.ledger().sequence() + 100;
+        client.create_match_pledge(&matcher, &pid, &0i128, &deadline);
+    }
+
+    #[test]
+    #[should_panic(expected = "Cap XLM must be positive")]
+    fn test_create_match_pledge_rejects_negative_cap() {
+        let (env, _cid, client, _admin, pid) = setup();
+        let matcher = Address::generate(&env);
+        let deadline = env.ledger().sequence() + 100;
+        client.create_match_pledge(&matcher, &pid, &-50i128, &deadline);
+    }
+
+    #[test]
+    #[should_panic(expected = "Deadline must be in the future")]
+    fn test_create_match_pledge_rejects_past_or_current_deadline() {
+        let (env, _cid, client, _admin, pid) = setup();
+        let matcher = Address::generate(&env);
+        let current_ledger = env.ledger().sequence();
+        client.create_match_pledge(&matcher, &pid, &(100 * STROOP), &current_ledger);
+    }
+
+    #[test]
+    #[should_panic(expected = "Project not found")]
+    fn test_create_match_pledge_rejects_non_existent_project() {
+        let (env, _cid, client, _admin, _pid) = setup();
+        let matcher = Address::generate(&env);
+        let non_existent = String::from_str(&env, "proj-404");
+        let deadline = env.ledger().sequence() + 100;
+        client.create_match_pledge(&matcher, &non_existent, &(100 * STROOP), &deadline);
+    }
+
+    #[test]
+    #[should_panic(expected = "Active match pledge already exists for this project")]
+    fn test_create_match_pledge_rejects_duplicate_active_pledge() {
+        let (env, _cid, client, _admin, pid) = setup();
+        let matcher1 = Address::generate(&env);
+        let matcher2 = Address::generate(&env);
+        let deadline = env.ledger().sequence() + 100;
+        client.create_match_pledge(&matcher1, &pid, &(100 * STROOP), &deadline);
+        client.create_match_pledge(&matcher2, &pid, &(50 * STROOP), &deadline);
+    }
+
+    #[test]
+    #[should_panic(expected = "Contract is paused")]
+    fn test_create_match_pledge_blocked_when_paused() {
+        let (env, _cid, client, admin, pid) = setup();
+        client.pause(&admin);
+        let matcher = Address::generate(&env);
+        let deadline = env.ledger().sequence() + 100;
+        client.create_match_pledge(&matcher, &pid, &(100 * STROOP), &deadline);
+    }
+
+    #[test]
+    fn test_cancel_match_pledge_by_matcher_and_admin() {
+        let (env, _cid, client, admin, pid) = setup();
+        let matcher = Address::generate(&env);
+        let cap = 100 * STROOP;
+        let deadline = env.ledger().sequence() + 200;
+
+        client.create_match_pledge(&matcher, &pid, &cap, &deadline);
+        assert!(client.get_active_match_status(&pid).has_active_match);
+
+        // Cancel by matcher
+        client.cancel_match_pledge(&matcher, &pid);
+        let pledge = client.get_match_pledge(&pid).unwrap();
+        assert!(!pledge.active);
+        assert!(!client.get_active_match_status(&pid).has_active_match);
+
+        // Reactivate by admin via set_match_pledge_status and cancel by admin
+        client.set_match_pledge_status(&admin, &pid, &true);
+        assert!(client.get_active_match_status(&pid).has_active_match);
+
+        client.cancel_match_pledge(&admin, &pid);
+        let pledge2 = client.get_match_pledge(&pid).unwrap();
+        assert!(!pledge2.active);
+    }
+
+    #[test]
+    #[should_panic(expected = "Only admin or matcher can cancel match pledge")]
+    fn test_cancel_match_pledge_rejects_unauthorized_caller() {
+        let (env, _cid, client, _admin, pid) = setup();
+        let matcher = Address::generate(&env);
+        let impostor = Address::generate(&env);
+        let deadline = env.ledger().sequence() + 200;
+        client.create_match_pledge(&matcher, &pid, &(100 * STROOP), &deadline);
+        client.cancel_match_pledge(&impostor, &pid);
+    }
+
+    #[test]
+    fn test_set_match_pledge_status_admin_only() {
+        let (env, _cid, client, admin, pid) = setup();
+        let matcher = Address::generate(&env);
+        let deadline = env.ledger().sequence() + 200;
+        client.create_match_pledge(&matcher, &pid, &(100 * STROOP), &deadline);
+
+        client.set_match_pledge_status(&admin, &pid, &false);
+        assert!(!client.get_match_pledge(&pid).unwrap().active);
+
+        client.set_match_pledge_status(&admin, &pid, &true);
+        assert!(client.get_match_pledge(&pid).unwrap().active);
+    }
+
+    #[test]
+    #[should_panic(expected = "Only admin can set match pledge status")]
+    fn test_set_match_pledge_status_rejects_non_admin() {
+        let (env, _cid, client, _admin, pid) = setup();
+        let matcher = Address::generate(&env);
+        let not_admin = Address::generate(&env);
+        let deadline = env.ledger().sequence() + 200;
+        client.create_match_pledge(&matcher, &pid, &(100 * STROOP), &deadline);
+        client.set_match_pledge_status(&not_admin, &pid, &false);
+    }
+
+    #[test]
+    fn test_matching_applied_during_donation() {
+        let (env, _cid, client, _admin, pid) = setup();
+        env.mock_all_auths_allowing_non_root_auth();
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token_client = StellarAssetClient::new(&env, &token);
+
+        let matcher = Address::generate(&env);
+        let donor = Address::generate(&env);
+        let wallet = client.get_project(&pid).wallet;
+
+        let cap = 100 * STROOP;
+        let deadline = env.ledger().sequence() + 500;
+        client.create_match_pledge(&matcher, &pid, &cap, &deadline);
+
+        token_client.mint(&matcher, &(100 * STROOP));
+        token_client.mint(&donor, &(100 * STROOP));
+
+        let donation_amt = 40 * STROOP;
+        client.donate(&token, &donor, &pid, &donation_amt, &1u32);
+
+        // Verification of balances:
+        // Donor transferred 40 XLM
+        assert_eq!(token_client.balance(&donor), 60 * STROOP);
+        // Matcher transferred 40 XLM (matched 1:1, doubling donor amount)
+        assert_eq!(token_client.balance(&matcher), 60 * STROOP);
+        // Project wallet received 40 + 40 = 80 XLM
+        assert_eq!(token_client.balance(&wallet), 80 * STROOP);
+
+        // Verification of contract accounting:
+        let pledge = client.get_match_pledge(&pid).unwrap();
+        assert_eq!(pledge.matched_amount, 40 * STROOP);
+        assert!(pledge.active);
+
+        let status = client.get_active_match_status(&pid);
+        assert!(status.has_active_match);
+        assert_eq!(status.matched_amount, 40 * STROOP);
+        assert_eq!(status.remaining_cap_xlm, 60 * STROOP);
+
+        // Project total raised received total_credited = 80 XLM
+        let project = client.get_project(&pid);
+        assert_eq!(project.total_raised, 40 * STROOP);
+        assert_eq!(client.get_global_total(), 80 * STROOP);
+
+        // Total CO2 increment credited for the full 80 XLM
+        // 80 XLM * 100 g/XLM = 8 000 g
+        assert_eq!(client.get_global_co2(), 8_000);
+
+        // Donor stats reflect donor's own donation (40 XLM)
+        let donor_stats = client.get_donor_stats(&donor);
+        assert_eq!(donor_stats.total_donated, 40 * STROOP);
+    }
+
+    #[test]
+    fn test_matching_cap_boundary_partial_match() {
+        let (env, _cid, client, _admin, pid) = setup();
+        env.mock_all_auths_allowing_non_root_auth();
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token_client = StellarAssetClient::new(&env, &token);
+
+        let matcher = Address::generate(&env);
+        let donor1 = Address::generate(&env);
+        let donor2 = Address::generate(&env);
+        let donor3 = Address::generate(&env);
+        let wallet = client.get_project(&pid).wallet;
+
+        let cap = 50 * STROOP;
+        let deadline = env.ledger().sequence() + 500;
+        client.create_match_pledge(&matcher, &pid, &cap, &deadline);
+
+        token_client.mint(&matcher, &(100 * STROOP));
+        token_client.mint(&donor1, &(100 * STROOP));
+        token_client.mint(&donor2, &(100 * STROOP));
+        token_client.mint(&donor3, &(100 * STROOP));
+
+        // First donation: 30 XLM. Matcher matches 30 XLM. Remaining cap: 20 XLM.
+        client.donate(&token, &donor1, &pid, &(30 * STROOP), &1u32);
+        assert_eq!(token_client.balance(&matcher), 70 * STROOP);
+        let status1 = client.get_active_match_status(&pid);
+        assert_eq!(status1.matched_amount, 30 * STROOP);
+        assert_eq!(status1.remaining_cap_xlm, 20 * STROOP);
+        assert!(status1.has_active_match);
+
+        // Second donation: 40 XLM. Remaining cap is only 20 XLM!
+        // So exactly 20 XLM is matched (cap boundary partial match).
+        client.donate(&token, &donor2, &pid, &(40 * STROOP), &2u32);
+
+        // Matcher deducted by only remaining 20 XLM (total 50 XLM = cap)
+        assert_eq!(token_client.balance(&matcher), 50 * STROOP);
+
+        // Wallet received: (30 + 30) + (40 + 20) = 120 XLM
+        assert_eq!(token_client.balance(&wallet), 120 * STROOP);
+
+        // Pledge matched_amount reaches cap (50 XLM) and pledge is deactivated
+        let pledge = client.get_match_pledge(&pid).unwrap();
+        assert_eq!(pledge.matched_amount, cap);
+        assert!(!pledge.active);
+
+        let status2 = client.get_active_match_status(&pid);
+        assert!(!status2.has_active_match);
+        assert_eq!(status2.remaining_cap_xlm, 0);
+
+        // Third donation: 10 XLM. Since pledge is exhausted, matching is NOT applied.
+        client.donate(&token, &donor3, &pid, &(10 * STROOP), &3u32);
+
+        // Matcher balance unchanged (still 50 XLM)
+        assert_eq!(token_client.balance(&matcher), 50 * STROOP);
+        // Wallet received only the 10 XLM from donor3 (120 + 10 = 130 XLM)
+        assert_eq!(token_client.balance(&wallet), 130 * STROOP);
+
+        // Accounting invariant: matched <= cap asserted
+        let final_pledge = client.get_match_pledge(&pid).unwrap();
+        assert!(final_pledge.matched_amount <= final_pledge.cap_xlm);
+        assert_eq!(final_pledge.matched_amount, cap);
+    }
+
+    #[test]
+    fn test_matching_expired_deadline_not_applied() {
+        let (env, _cid, client, _admin, pid) = setup();
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token_client = StellarAssetClient::new(&env, &token);
+
+        let matcher = Address::generate(&env);
+        let donor = Address::generate(&env);
+        let wallet = client.get_project(&pid).wallet;
+
+        let cap = 100 * STROOP;
+        let start_ledger = env.ledger().sequence();
+        let deadline = start_ledger + 50;
+        client.create_match_pledge(&matcher, &pid, &cap, &deadline);
+
+        token_client.mint(&matcher, &(100 * STROOP));
+        token_client.mint(&donor, &(100 * STROOP));
+
+        // Advance ledger sequence past deadline
+        env.ledger().set_sequence_number(deadline + 1);
+
+        let status = client.get_active_match_status(&pid);
+        assert!(!status.has_active_match);
+
+        // Donate after deadline
+        client.donate(&token, &donor, &pid, &(20 * STROOP), &1u32);
+
+        // Matcher balance remains untouched
+        assert_eq!(token_client.balance(&matcher), 100 * STROOP);
+        // Wallet received only donor's 20 XLM
+        assert_eq!(token_client.balance(&wallet), 20 * STROOP);
+
+        let pledge = client.get_match_pledge(&pid).unwrap();
+        assert_eq!(pledge.matched_amount, 0);
+    }
+
+    #[test]
+    fn test_can_create_new_pledge_after_previous_exhausted_or_expired() {
+        let (env, _cid, client, _admin, pid) = setup();
+        env.mock_all_auths_allowing_non_root_auth();
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token_client = StellarAssetClient::new(&env, &token);
+
+        let matcher1 = Address::generate(&env);
+        let matcher2 = Address::generate(&env);
+        let donor = Address::generate(&env);
+
+        let cap1 = 20 * STROOP;
+        let deadline1 = env.ledger().sequence() + 100;
+        client.create_match_pledge(&matcher1, &pid, &cap1, &deadline1);
+
+        token_client.mint(&matcher1, &cap1);
+        token_client.mint(&donor, &(50 * STROOP));
+
+        // Exhaust first pledge
+        client.donate(&token, &donor, &pid, &(20 * STROOP), &1u32);
+        assert!(!client.get_active_match_status(&pid).has_active_match);
+
+        // Creating a new pledge for the same project now succeeds because previous is exhausted
+        let cap2 = 50 * STROOP;
+        let deadline2 = env.ledger().sequence() + 200;
+        client.create_match_pledge(&matcher2, &pid, &cap2, &deadline2);
+
+        let status2 = client.get_active_match_status(&pid);
+        assert!(status2.has_active_match);
+        assert_eq!(status2.matcher, Some(matcher2));
+        assert_eq!(status2.cap_xlm, cap2);
+    }
+
+    #[test]
+    fn test_get_active_match_status_no_pledge() {
+        let (env, _cid, client, _admin, _pid) = setup();
+        let unpledged_pid = String::from_str(&env, "proj-unpledged");
+        let status = client.get_active_match_status(&unpledged_pid);
+        assert!(!status.has_active_match);
+        assert_eq!(status.matcher, None);
+        assert_eq!(status.cap_xlm, 0);
+        assert_eq!(status.matched_amount, 0);
+        assert_eq!(status.remaining_cap_xlm, 0);
+        assert_eq!(status.deadline_ledger, 0);
     }
 }
